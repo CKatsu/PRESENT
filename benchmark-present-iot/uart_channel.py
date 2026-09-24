@@ -40,6 +40,11 @@ class _StreamChannel(cb.Channel):
         self._buf = bytearray()
         self._stop = threading.Event()
         self._reader: Optional[threading.Thread] = None
+        # diagnostik (dibaca receiver_server untuk laporan "belum ada paket")
+        self.bytes_rx = 0            # total byte mentah yang datang dari port
+        self.lines_proto = 0         # baris berprefix PRS1 yang valid
+        self.lines_other = 0         # baris lain (mis. log boot firmware) / JSON korup
+        self.raw_hook = None         # opsional: fn(text) dipanggil utk baris non-protokol (--show-raw)
 
     # --- primitif yang diimplementasikan subclass ---------------------------
     def _open(self) -> None: raise NotImplementedError
@@ -79,6 +84,7 @@ class _StreamChannel(cb.Channel):
             chunk = self._read_some(min(remaining, 0.05))
             if chunk is None:
                 return None
+            self.bytes_rx += len(chunk)
             self._buf.extend(chunk)
 
     def _reader_loop(self) -> None:
@@ -113,7 +119,12 @@ class _StreamChannel(cb.Channel):
                 return None
             obj = cb.decode_line(line)
             if obj is not None:
-                return obj          # baris non-protokol/korup: diabaikan, lanjut membaca
+                self.lines_proto += 1
+                return obj
+            # baris non-protokol/korup: diabaikan, tapi dihitung & (opsional) ditampilkan
+            self.lines_other += 1
+            if self.raw_hook is not None and line.strip():
+                self.raw_hook(line.decode("utf-8", errors="replace").rstrip())
 
 
 class UartChannel(_StreamChannel):

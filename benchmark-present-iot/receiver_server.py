@@ -138,10 +138,19 @@ class Receiver:
         self._lock = threading.Lock()                # 1 gateway = 1 pemroses (model penerima tunggal)
         self._seen: "collections.OrderedDict" = collections.OrderedDict()   # dedupe (QoS1 bisa duplikat)
         self.processed = 0
+        self._last = (None, 0, 0)
 
     def handle(self, msg: dict, transport: str, link: str) -> dict:
         with self._lock:
             return self._handle(msg, transport, link)
+
+    def handle_detailed(self, msg: dict, transport: str, link: str):
+        """Seperti handle(), tetapi juga mengembalikan (ack, reading, key_bits, ct_len) untuk log per pesan."""
+        with self._lock:
+            self._last = (None, 0, 0)
+            ack = self._handle(msg, transport, link)
+            reading, key_bits, ct_len = self._last
+            return ack, reading, key_bits, ct_len
 
     def _handle(self, msg: dict, transport: str, link: str) -> dict:
         device_id = str(msg.get("device_id", "unknown"))
@@ -193,6 +202,7 @@ class Receiver:
                     except (ValueError, KeyError, UnicodeDecodeError):
                         reason = "payload_error"
 
+        self._last = (reading, key_bits, ct_len)
         cpu_s = metrics.cpu_time_s()
         rss = self.monitor.latest()[1] if self.monitor else 0.0
         ack = {"ack": 1, "device_id": device_id, "seq": seq, "run_id": run_id, "accepted": accepted,
@@ -226,25 +236,56 @@ class ReceiverService:
     """Menjalankan satu thread listener per channel (uart/tcp/mqtt). Dapat dipakai
     dari CLI maupun in-process (tests)."""
 
-    def __init__(self, channels, receiver: Receiver):
-        self.channels, self.receiver = channels, receiver
+    def __init__(self, channels, receiver: Receiver, verbose: bool = True):
+        self.channels, self.receiver, self.verbose = channels, receiver, verbose
         self._stop = threading.Event()
         self._threads = []
         self._ready = {id(c): threading.Event() for c in channels}
+
+    @staticmethod
+    def _format_result(msg, ack, reading, key_bits, ct_len) -> str:
+        head = (f"device={ack['device_id']} seq={ack['seq']} scenario={msg.get('scenario', '-')} "
+                f"key={key_bits or msg.get('key_bits', '?')}bit ct={ct_len}B")
+        if ack["accepted"]:
+            data = ""
+            if reading is not None:
+                data = (f" temp={reading['temp_c']:.2f}C hum={reading['hum_pct']:.1f}% "
+                        f"pres={reading['pres_hpa']:.1f}hPa "
+                        f"[{'SINTETIS' if reading['synthetic'] else 'SENSOR FISIK'}]")
+            enc = f" enc_fw={msg['enc_us']}us" if str(msg.get("enc_us", "")).isdigit() else ""
+            return f"Pesan DITERIMA  {head}{data}{enc}"
+        return f"Pesan DITOLAK    {head} alasan={ack['reason']} (condition={msg.get('condition', '-')})"
 
     def _listen(self, ch):
         try:
             with ch:
                 self._ready[id(ch)].set()
                 log.info("Listener aktif: jalur=%s link=%s", ch.name, ch.link)
+                last_note = time.monotonic()
+                shown = 0
                 while not self._stop.is_set():
                     t0 = time.monotonic()
                     msg = ch.recv_data(0.5)
                     if msg is None:
                         if time.monotonic() - t0 < 0.1:
                             time.sleep(0.1)                 # hindari busy-loop bila lawan bicara putus
+                        # diagnostik: tiap 5 dtk tanpa paket valid, laporkan apa yang sebenarnya masuk dari port
+                        if hasattr(ch, "bytes_rx") and self.receiver.processed == 0 \
+                                and time.monotonic() - last_note >= 5.0:
+                            last_note = time.monotonic()
+                            log.info("[%s] belum ada paket PRS1 valid | byte diterima dari port: %d | "
+                                     "baris non-protokol: %d%s", ch.name, ch.bytes_rx, ch.lines_other,
+                                     "  -> port tidak mengirim apa pun (cek port/kabel/firmware)"
+                                     if ch.bytes_rx == 0 else
+                                     "  -> ada data tapi bukan format PRS1 (coba --show-raw, cek baud)")
                         continue
-                    ack = self.receiver.handle(msg, ch.name, ch.link)
+                    ack, reading, key_bits, ct_len = self.receiver.handle_detailed(msg, ch.name, ch.link)
+                    if self.verbose:
+                        log.info("%s", self._format_result(msg, ack, reading, key_bits, ct_len))
+                    else:                                    # mode ringkas: cetak 10 pertama lalu tiap 50 pesan
+                        shown += 1
+                        if shown <= 10 or shown % 50 == 0:
+                            log.info("%s", self._format_result(msg, ack, reading, key_bits, ct_len))
                     try:
                         ch.send_ack(ack)
                     except Exception as exc:               # noqa: BLE001
@@ -279,6 +320,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--db-path", default=config.DB_PATH)
     p.add_argument("--csv-name", default="all", help="nama berkas results/server_<name>.csv")
     p.add_argument("--no-monitor", action="store_true")
+    p.add_argument("--show-raw", action="store_true",
+                   help="tampilkan baris non-protokol dari port (mis. log boot firmware) sebagai '[fw] ...'")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--verbose", action="store_true", help="cetak SETIAP pesan yang diproses")
+    g.add_argument("--quiet", action="store_true", help="ringkas: 10 pesan pertama lalu tiap 50 pesan")
+    # Default: hanya --uart-port (uji hardware) -> verbose; bila ada --tcp-port/--mqtt (benchmark) -> ringkas,
+    # karena log per pesan memakai CPU/IO receiver dan akan memengaruhi pengukuran CPU% & RTT.
     return p
 
 
@@ -303,7 +351,13 @@ def main(argv=None):
         monitor = metrics.ResourceMonitor("receiver", config.metrics_csv_path("resources", "receiver"),
                                           config.RESOURCE_SAMPLING_INTERVAL_S)
         monitor.start()
-    svc = ReceiverService(channels, Receiver(writer, monitor))
+    if args.show_raw:
+        for ch in channels:
+            if hasattr(ch, "raw_hook"):
+                ch.raw_hook = lambda text: log.info("[fw] %s", text)
+    hardware_only = bool(args.uart_port) and not args.tcp_port and not args.mqtt
+    verbose = args.verbose or (hardware_only and not args.quiet)
+    svc = ReceiverService(channels, Receiver(writer, monitor), verbose=verbose)
     svc.start()
     log.info("receiver_server siap. DB=%s CSV=%s  (Ctrl+C untuk berhenti)", args.db_path, csv_path)
     try:
