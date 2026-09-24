@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+# Hasil pengujian dibangkitkan lokal (reproducible), bukan dibawa di repository
+benchmark-present-iot/data/*.sqlite
+benchmark-present-iot/results/*.csv
+benchmark-present-iot/results/*.json
+benchmark-present-iot/results/*.log
+benchmark-present-iot/results/charts/*.png
+benchmark-present-iot/dashboard/summary.json
+esp32-firmware/.pio/
+esp32-firmware/include/secrets.h
+esp32-firmware/host_test/build/

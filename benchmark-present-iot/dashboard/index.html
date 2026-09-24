@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard Benchmark PRESENT-IoT</title>
+<!--
+  Dashboard NON-REAL-TIME: membaca summary.json SEKALI saat halaman dibuka dan setiap
+  kali tombol "Muat Ulang Data" ditekan. TIDAK ada polling / auto-refresh / WebSocket.
+  Data berasal dari `python3 analyze.py` (hasil pengujian nyata; tanpa data = placeholder).
+  Jalankan:  cd dashboard  &&  python3 -m http.server 8000   ->  http://localhost:8000
+-->
+<style>
+  :root {
+    --bg:#fcfcfb; --surface:#ffffff; --ink:#0b0b0b; --ink2:#52514e; --muted:#7a7975; --line:#e3e2de; --grid:#eceae6;
+    --s1:#2a78d6; --s2:#eb6834; --warn-bg:#fff4e0; --warn-ink:#7a4b00; --ok-ink:#0d5c2e; --bad-ink:#a3221f; --chip:#f0efec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#141413; --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7; --muted:#96958c; --line:#2f2f2c; --grid:#2a2a27;
+      --s1:#3987e5; --s2:#d95926; --warn-bg:#3a2c10; --warn-ink:#f2c879; --ok-ink:#7fd39b; --bad-ink:#ff8f8c; --chip:#2a2a27;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#141413; --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7; --muted:#96958c; --line:#2f2f2c; --grid:#2a2a27;
+    --s1:#3987e5; --s2:#d95926; --warn-bg:#3a2c10; --warn-ink:#f2c879; --ok-ink:#7fd39b; --bad-ink:#ff8f8c; --chip:#2a2a27;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:20px 16px 60px; }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; margin-bottom:14px; }
+  h1 { font-size:20px; margin:0; } h2 { font-size:16px; margin:28px 0 8px; } h3 { font-size:13px; margin:14px 0 6px; color:var(--ink2); }
+  .sub { color:var(--ink2); font-size:12px; }
+  button { font:inherit; padding:7px 14px; border:1px solid var(--line); background:var(--surface); color:var(--ink); border-radius:8px; cursor:pointer; }
+  button:hover { border-color:var(--s1); }
+  .card { background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); }
+  .kpi .v { font-size:26px; font-weight:600; } .kpi .l { color:var(--ink2); font-size:12px; }
+  .warn { background:var(--warn-bg); color:var(--warn-ink); border-radius:10px; padding:10px 14px; margin:10px 0; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { text-align:right; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th:first-child,td:first-child,th.l,td.l { text-align:left; } th { color:var(--ink2); font-weight:600; }
+  .scroll { overflow-x:auto; }
+  .chip { display:inline-block; padding:1px 8px; border-radius:999px; background:var(--chip); font-size:11px; }
+  .syn { background:var(--warn-bg); color:var(--warn-ink); }
+  .ok { color:var(--ok-ink); font-weight:600; } .bad { color:var(--bad-ink); font-weight:600; }
+  svg text { fill:var(--ink2); font-size:11px; } svg .ttl { fill:var(--ink); font-size:12px; font-weight:600; }
+  .legend { display:flex; gap:14px; font-size:12px; color:var(--ink2); margin:4px 0 0 4px; }
+  .sw { display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:5px; vertical-align:-1px; }
+  ul { margin:6px 0; padding-left:20px; color:var(--ink2); }
+  .tip { position:fixed; pointer-events:none; background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:6px 9px; font-size:12px; display:none; z-index:5; box-shadow:0 2px 8px rgba(0,0,0,.15); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Benchmark PRESENT-CBC + CBC-MAC pada IoT</h1>
+      <div class="sub" id="meta">Memuat…</div>
+    </div>
+    <div><button id="reload">Muat Ulang Data</button></div>
+  </header>
+  <div class="warn" id="banner" hidden></div>
+  <div id="root"></div>
+  <div class="tip" id="tip"></div>
+</main>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "—" : Number(v).toFixed(d);
+const pct = (v, d = 1) => (v === null || v === undefined) ? "—" : (100 * v).toFixed(d) + "%";
+const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const PLACEHOLDER = "[HASIL PENGUJIAN]";
+
+async function load() {
+  $("#meta").textContent = "Memuat summary.json …";
+  try {
+    const r = await fetch("summary.json", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+  } catch (e) {
+    $("#root").innerHTML = "";
+    const b = $("#banner"); b.hidden = false;
+    b.textContent = "summary.json belum bisa dimuat (" + e.message + "). Jalankan `python3 analyze.py`, lalu buka halaman ini lewat " +
+      "`python3 -m http.server 8000` di folder dashboard/ (membuka file:// langsung diblokir browser). " + PLACEHOLDER;
+    $("#meta").textContent = "Belum ada data.";
+  }
+}
+
+function chart(title, xlabel, ylabel, series, xticks) {
+  // series: [{name,color,pts:[{x,y,lo,hi,label}]}] ; sumbu-Y tunggal mulai dari 0 ; whisker = CI 95%
+  const W = 520, H = 280, m = { l: 52, r: 14, t: 30, b: 42 };
+  const all = series.flatMap((s) => s.pts);
+  if (!all.length) return `<div class="card"><div class="sub">${esc(title)}: ${PLACEHOLDER}</div></div>`;
+  const ymax = Math.max(...all.map((p) => (p.hi ?? p.y))) * 1.08 || 1;
+  const xs = xticks, xi = (x) => m.l + (xs.indexOf(x) + 0.5) / xs.length * (W - m.l - m.r);
+  const yi = (y) => H - m.b - (y / ymax) * (H - m.t - m.b);
+  let g = `<text class="ttl" x="${m.l}" y="16">${esc(title)}</text>`;
+  for (let i = 0; i <= 4; i++) {
+    const yv = ymax * i / 4, y = yi(yv);
+    g += `<line x1="${m.l}" x2="${W - m.r}" y1="${y}" y2="${y}" stroke="${css("--grid")}"/><text x="${m.l - 6}" y="${y + 4}" text-anchor="end">${yv.toFixed(ymax < 10 ? 2 : 0)}</text>`;
+  }
+  xs.forEach((x) => { g += `<text x="${xi(x)}" y="${H - m.b + 16}" text-anchor="middle">${x}</text>`; });
+  g += `<text x="${(m.l + W - m.r) / 2}" y="${H - 6}" text-anchor="middle">${esc(xlabel)}</text>`;
+  g += `<text transform="translate(12 ${(m.t + H - m.b) / 2}) rotate(-90)" text-anchor="middle">${esc(ylabel)}</text>`;
+  series.forEach((s) => {
+    const pts = s.pts.filter((p) => xs.includes(p.x)).sort((a, b) => xs.indexOf(a.x) - xs.indexOf(b.x));
+    g += `<polyline fill="none" stroke="${s.color}" stroke-width="2" points="${pts.map((p) => xi(p.x) + "," + yi(p.y)).join(" ")}"/>`;
+    pts.forEach((p) => {
+      if (p.lo != null && p.hi != null) g += `<line x1="${xi(p.x)}" x2="${xi(p.x)}" y1="${yi(p.lo)}" y2="${yi(p.hi)}" stroke="${s.color}" stroke-width="1.5"/>`;
+      g += `<circle cx="${xi(p.x)}" cy="${yi(p.y)}" r="4.5" fill="${s.color}" stroke="${css("--surface")}" stroke-width="2" data-tip="${esc(s.name + " | x=" + p.x + " | " + p.label)}"/>`;
+    });
+  });
+  const legend = series.map((s) => `<span><span class="sw" style="background:${s.color}"></span>${esc(s.name)}</span>`).join("");
+  return `<div class="card"><svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="${esc(title)}">${g}</svg><div class="legend">${legend}</div></div>`;
+}
+
+function blocksTable(rows, cols) {
+  if (!rows.length) return `<div class="sub">${PLACEHOLDER}</div>`;
+  const head = cols.map((c) => `<th>${c[0]}</th>`).join("");
+  const body = rows.map((r) => "<tr>" + cols.map((c) => `<td>${c[1](r)}</td>`).join("") + "</tr>").join("");
+  return `<div class="scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function render(d) {
+  const b = $("#banner");
+  if (d.status !== "ok") { b.hidden = false; b.textContent = d.placeholder || PLACEHOLDER; } else b.hidden = true;
+  $("#meta").textContent = "Dibuat oleh analyze.py: " + d.generated_at + " · sesi: " + d.session_mode + " · dimuat sekali (bukan real-time)";
+  const blocks = d.blocks || [], s4 = d.s4 || [], sen = d.sensor || {};
+  const ci = (r, m, dd = 2) => `${fmt(r[m + "_mean"], dd)} ± ${fmt((r[m + "_ci_hi"] ?? null) === null ? null : r[m + "_ci_hi"] - r[m + "_mean"], dd)}`;
+  const sd = (r, m, dd = 2) => fmt(r[m + "_sd"], dd);
+  const trName = (r) => `${r.transport.toUpperCase()} <span class="chip">${esc(r.link)}</span>`;
+
+  const tam = s4.filter((r) => r.kondisi === "tampered" && r.varian === "(semua tampered)");
+  const nor = s4.filter((r) => r.kondisi === "normal");
+  const dr = tam.length ? tam.reduce((a, r) => a + r.ditolak, 0) / Math.max(1, tam.reduce((a, r) => a + r.dijawab, 0)) : null;
+  const frr = nor.length ? nor.reduce((a, r) => a + r.ditolak, 0) / Math.max(1, nor.reduce((a, r) => a + r.dijawab, 0)) : null;
+  const nMsg = blocks.reduce((a, r) => a + (r.n_messages || 0), 0);
+  let html = `<div class="grid">
+    <div class="card kpi"><div class="v">${blocks.length}</div><div class="l">Blok parameter S1–S3 terekam</div></div>
+    <div class="card kpi"><div class="v">${nMsg.toLocaleString("id-ID")}</div><div class="l">Pesan performa (tanpa warmup)</div></div>
+    <div class="card kpi"><div class="v">${pct(dr)}</div><div class="l">Detection rate S4 (target 100%)</div></div>
+    <div class="card kpi"><div class="v">${pct(frr)}</div><div class="l">False rejection rate S4 (target 0%)</div></div></div>`;
+
+  // S1 + S2
+  const s12 = blocks.filter((r) => r.scenario === "S1" || r.scenario === "S2");
+  html += `<h2>S1 baseline & S2 variasi ukuran payload</h2>` + blocksTable(s12.sort((a, b) => a.scenario.localeCompare(b.scenario) || a.transport.localeCompare(b.transport) || a.payload_bytes - b.payload_bytes), [
+    ["Skenario", (r) => r.scenario], ["Jalur", trName], ["Kunci", (r) => r.key_bits + "-bit"], ["Payload (B)", (r) => r.payload_bytes],
+    ["Ciphertext (B)", (r) => fmt(r.ciphertext_bytes, 0)], ["Overhead", (r) => fmt(r.overhead_pct, 1) + "%"], ["n ronde", (r) => r.n_rounds],
+    ["RTT ms (mean ± CI95)", (r) => ci(r, "rtt_ms", 3)], ["SD", (r) => sd(r, "rtt_ms", 3)], ["Throughput kB/s", (r) => ci(r, "throughput_kBps", 1)],
+    ["CBC-enc ms", (r) => fmt(r.encrypt_ms_mean, 3)], ["CBC-MAC ms", (r) => fmt(r.mac_ms_mean, 3)],
+    ["CPU rx %", (r) => fmt(r.rx_cpu_pct_block, 1)], ["RAM rx MB", (r) => fmt(r.rx_rss_mb_mean, 1)]]);
+  const s2 = blocks.filter((r) => r.scenario === "S2"), pays = [...new Set(s2.map((r) => r.payload_bytes))].sort((a, b) => a - b);
+  const mk = (rows, col, tr, color) => ({ name: tr.toUpperCase(), color, pts: rows.filter((r) => r.transport === tr).map((r) => ({ x: r.payload_bytes, y: r[col + "_mean"], lo: r[col + "_ci_lo"], hi: r[col + "_ci_hi"], label: fmt(r[col + "_mean"], 3) })) });
+  html += `<div class="grid" style="margin-top:12px">` +
+    chart("S2 — RTT vs ukuran payload", "Payload plaintext (byte)", "RTT (ms)", [mk(s2, "rtt_ms", "uart", css("--s1")), mk(s2, "rtt_ms", "mqtt", css("--s2"))], pays) +
+    chart("S2 — Throughput vs ukuran payload", "Payload plaintext (byte)", "kB/s (plaintext)", [mk(s2, "throughput_kBps", "uart", css("--s1")), mk(s2, "throughput_kBps", "mqtt", css("--s2"))], pays) + `</div>`;
+
+  // S3
+  const s3 = blocks.filter((r) => r.scenario === "S3");
+  html += `<h2>S3 variasi panjang kunci × konkurensi</h2>` + blocksTable(s3.sort((a, b) => a.transport.localeCompare(b.transport) || a.key_bits - b.key_bits || a.concurrency - b.concurrency), [
+    ["Jalur", trName], ["Kunci", (r) => r.key_bits + "-bit"], ["Perangkat", (r) => r.concurrency], ["n ronde", (r) => r.n_rounds],
+    ["RTT ms (mean ± CI95)", (r) => ci(r, "rtt_ms", 2)], ["SD", (r) => sd(r, "rtt_ms", 2)], ["p95 pesan", (r) => fmt(r.rtt_msg_p95_ms, 2)],
+    ["Throughput agregat kB/s", (r) => ci(r, "throughput_kBps", 1)], ["CPU tx %", (r) => fmt(r.tx_cpu_pct_block, 1)], ["CPU rx %", (r) => fmt(r.rx_cpu_pct_block, 1)],
+    ["RAM rx MB", (r) => fmt(r.rx_rss_mb_mean, 1)], ["Lost", (r) => r.n_lost_total ?? "—"]]);
+  const conc = [...new Set(s3.map((r) => r.concurrency))].sort((a, b) => a - b);
+  const mk3 = (tr, kb, color, col) => ({ name: `PRESENT-${kb}`, color, pts: s3.filter((r) => r.transport === tr && r.key_bits === kb).map((r) => ({ x: r.concurrency, y: r[col + "_mean"], lo: r[col + "_ci_lo"], hi: r[col + "_ci_hi"], label: fmt(r[col + "_mean"], 2) })) });
+  html += `<div class="grid" style="margin-top:12px">` + ["uart", "mqtt"].map((tr) =>
+    chart(`S3 — RTT vs konkurensi (${tr.toUpperCase()})`, "Jumlah perangkat konkuren", "RTT (ms)", [mk3(tr, 80, css("--s1"), "rtt_ms"), mk3(tr, 128, css("--s2"), "rtt_ms")], conc)).join("") + `</div>`;
+
+  // S4
+  html += `<h2>S4 normal vs tampered</h2>` + blocksTable(s4, [
+    ["Jalur", trName], ["Kunci", (r) => r.key_bits + "-bit"], ["Kondisi", (r) => r.kondisi], ["Varian", (r) => r.varian],
+    ["Dikirim", (r) => r.dikirim], ["Lost", (r) => r.lost], ["Ditolak", (r) => r.ditolak], ["Diterima", (r) => r.diterima],
+    ["Metrik", (r) => r.metrik === "detection_rate" ? "DR" : "FRR"],
+    ["Nilai", (r) => { const good = r.kondisi === "tampered" ? r.rate === 1 : r.rate === 0; return `<span class="${good ? "ok" : "bad"}">${good ? "✔ " : "✖ "}${pct(r.rate)}</span>`; }],
+    ["CI95 (Clopper–Pearson)", (r) => `${pct(r.ci_lo)} – ${pct(r.ci_hi)}`]]);
+
+  // Sensor
+  html += `<h2>Streaming data sensor suhu (dari SQLite)</h2>`;
+  if (!sen.available || !sen.stream_rows) {
+    html += `<div class="card sub">${PLACEHOLDER} Belum ada data streaming. Jalankan <code>device_sim.py --stream</code> (atau firmware ESP32-S3) lalu <code>analyze.py</code>.</div>`;
+  } else {
+    const rows = sen.rows.slice(-20).reverse();
+    html += `<div class="card"><div>${sen.stream_rows} pembacaan terakhir · suhu rata-rata ${fmt(sen.temp.mean, 2)} °C (min ${fmt(sen.temp.min, 2)}, maks ${fmt(sen.temp.max, 2)}) ·
+      sumber: <span class="chip ${sen.synthetic_fraction > 0 ? "syn" : ""}">${sen.synthetic_fraction === 1 ? "SINTETIS (bukan sensor fisik)" : sen.synthetic_fraction === 0 ? "SENSOR FISIK" : "CAMPURAN (" + pct(sen.synthetic_fraction, 0) + " sintetis)"}</span></div></div>` +
+      blocksTable(rows, [["Waktu", (r) => new Date(r.received_at_unix * 1000).toLocaleTimeString("id-ID")], ["Perangkat", (r) => r.device_id], ["Seq", (r) => r.seq],
+        ["Suhu °C", (r) => fmt(r.temp_c, 2)], ["RH %", (r) => fmt(r.hum_pct, 1)], ["hPa", (r) => fmt(r.pres_hpa, 1)], ["Jalur", (r) => r.transport],
+        ["Kunci", (r) => r.key_bits + "-bit"], ["Sumber", (r) => r.is_synthetic_sensor ? '<span class="chip syn">SINTETIS</span>' : '<span class="chip">FISIK</span>']]);
+  }
+
+  html += `<h2>Batasan pengujian</h2><ul>${(d.caveats || []).map((c) => `<li>${esc(c)}</li>`).join("")}</ul>`;
+  if ((d.notes || []).length) html += `<h3>Catatan analisis</h3><ul>${d.notes.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>`;
+  if ((d.sessions || []).length) {
+    const s = d.sessions[d.sessions.length - 1];
+    html += `<h3>Reproducibility (sesi terakhir)</h3><div class="card sub">sesi ${esc(s.session_id)} · Python ${esc(s.python)} · ${esc(s.platform)} · CPU ${esc(s.processor || "?")} (${s.cpu_count} core) · ulangan ${s.repeats} · warmup sesi ${s.warmup_session_msgs} + ${s.warmup_rounds_per_block} ronde/blok · MQTT QoS ${s.mqtt_qos} · pustaka: ${esc(JSON.stringify(s.libs))}</div>`;
+  }
+  $("#root").innerHTML = html;
+}
+
+document.addEventListener("mouseover", (e) => {
+  const t = e.target.closest && e.target.closest("[data-tip]"), tip = $("#tip");
+  if (!t) { tip.style.display = "none"; return; }
+  tip.textContent = t.getAttribute("data-tip"); tip.style.display = "block";
+});
+document.addEventListener("mousemove", (e) => { const tip = $("#tip"); tip.style.left = e.clientX + 12 + "px"; tip.style.top = e.clientY + 12 + "px"; });
+$("#reload").addEventListener("click", load);
+load();   // satu kali saat halaman dibuka; tidak ada setInterval/polling
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+# Dependensi Python untuk benchmark-present-iot/  (pasang: python3 -m pip install -r requirements.txt)
+pyserial>=3.5        # uart_channel.py (UART/USB-Serial ke ESP32-S3)
+paho-mqtt>=1.6       # mqtt_channel.py (broker Mosquitto); kompatibel 1.x dan 2.x
+psutil>=5.9          # metrics.py (CPU/RAM)
+pandas>=2.0          # analyze.py
+numpy>=1.24
+scipy>=1.10          # CI (distribusi t), Clopper-Pearson
+matplotlib>=3.7      # grafik untuk lampiran skripsi
